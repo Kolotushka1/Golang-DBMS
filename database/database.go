@@ -29,14 +29,16 @@ func (dt DataType) String() string {
 }
 
 type Column struct {
-	Name string
-	Type DataType
+	Name          string
+	Type          DataType
+	AutoIncrement bool
 }
 
 type Table struct {
-	Name    string
-	Columns []Column
-	Rows    [][]interface{}
+	Name            string
+	Columns         []Column
+	Rows            [][]interface{}
+	autoIncrementID map[string]int
 }
 
 type Database struct {
@@ -60,90 +62,140 @@ func (db *Database) ExecuteSQL(query string) ([][]interface{}, error) {
 	return ParseAndExecute(db, query)
 }
 
-func (db *Database) CreateTable(name string, columns []Column) error {
+func (db *Database) CreateTable(tableName string, columns []Column) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	name = strings.ToLower(name)
-	if _, exists := db.Tables[name]; exists {
-		return fmt.Errorf("таблица '%s' уже существует", name)
+
+	tableName = strings.ToLower(tableName)
+	if _, exists := db.Tables[tableName]; exists {
+		return fmt.Errorf("таблица '%s' уже существует", tableName)
 	}
-	db.Tables[name] = &Table{
-		Name:    name,
-		Columns: columns,
-		Rows:    [][]interface{}{},
+
+	autoIncMap := make(map[string]int)
+	for _, col := range columns {
+		if col.AutoIncrement {
+			autoIncMap[col.Name] = 0
+		}
 	}
-	return db.saveTableToDisk(name)
+
+	table := &Table{
+		Name:            tableName,
+		Columns:         columns,
+		Rows:            [][]interface{}{},
+		autoIncrementID: autoIncMap,
+	}
+
+	db.Tables[tableName] = table
+
+	err := db.saveTableToDisk(tableName)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func (db *Database) Insert(tableName string, values []string) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
+
 	tableName = strings.ToLower(tableName)
 	table, exists := db.Tables[tableName]
 	if !exists {
 		return fmt.Errorf("таблица '%s' не существует", tableName)
 	}
-	if len(values) != len(table.Columns) {
-		return fmt.Errorf("количество значений не соответствует количеству столбцов в таблице '%s'", tableName)
-	}
-	row := make([]interface{}, len(values))
-	for i, val := range values {
-		switch table.Columns[i].Type {
-		case STRING:
-			row[i] = val
-		case INTEGER:
-			intval, err := strconv.Atoi(val)
-			if err != nil {
-				return fmt.Errorf("ошибка преобразования '%s' в INTEGER: %v", val, err)
+
+	if len(values) < len(table.Columns) {
+		newValues := make([]interface{}, len(table.Columns))
+		valueIndex := 0
+		for i, col := range table.Columns {
+			if col.AutoIncrement {
+				table.autoIncrementID[col.Name]++
+				newValues[i] = table.autoIncrementID[col.Name]
+			} else {
+				if valueIndex >= len(values) {
+					newValues[i] = nil
+				} else {
+					val, err := parseValue(values[valueIndex], col.Type)
+					if err != nil {
+						return err
+					}
+					newValues[i] = val
+					valueIndex++
+				}
 			}
-			row[i] = intval
-		case FLOAT:
-			floatval, err := strconv.ParseFloat(val, 64)
-			if err != nil {
-				return fmt.Errorf("ошибка преобразования '%s' в FLOAT: %v", val, err)
+		}
+		table.Rows = append(table.Rows, newValues)
+	} else {
+		newValues := make([]interface{}, len(table.Columns))
+		for i, col := range table.Columns {
+			if col.AutoIncrement {
+				table.autoIncrementID[col.Name]++
+				newValues[i] = table.autoIncrementID[col.Name]
+			} else {
+				if i >= len(values) {
+					newValues[i] = nil
+				} else {
+					val, err := parseValue(values[i], col.Type)
+					if err != nil {
+						return err
+					}
+					newValues[i] = val
+				}
 			}
-			row[i] = floatval
 		}
+		table.Rows = append(table.Rows, newValues)
 	}
-	table.Rows = append(table.Rows, row)
-	if db.transaction != nil {
-		op := Operation{
-			Type:      "INSERT",
-			TableName: tableName,
-			Data:      row,
-		}
-		db.transaction.operations = append(db.transaction.operations, op)
+
+	// Сохранение на диск
+	err := db.saveTableToDisk(tableName)
+	if err != nil {
+		return err
 	}
-	return db.saveTableToDisk(tableName)
+
+	return nil
+}
+
+func parseValue(value string, dataType DataType) (interface{}, error) {
+	switch dataType {
+	case INTEGER:
+		return strconv.Atoi(value)
+	case FLOAT:
+		return strconv.ParseFloat(value, 64)
+	case STRING:
+		return value, nil
+	default:
+		return nil, fmt.Errorf("неизвестный тип данных %v", dataType)
+	}
 }
 
 func (db *Database) Select(tableName string, condition *Condition) ([][]interface{}, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
-	tableName = strings.ToLower(tableName)
-	table, exists := db.Tables[tableName]
+
+	table, exists := db.Tables[strings.ToLower(tableName)]
 	if !exists {
 		return nil, fmt.Errorf("таблица '%s' не существует", tableName)
 	}
+
+	var columnNames []string
+	for _, col := range table.Columns {
+		columnNames = append(columnNames, col.Name)
+	}
+
 	var result [][]interface{}
 	for _, row := range table.Rows {
 		if condition != nil {
-			colIndex := getColumnIndex(table, condition.Column)
-			if colIndex == -1 {
-				return nil, fmt.Errorf("столбец '%s' не найден в таблице '%s'", condition.Column, tableName)
-			}
-			value := row[colIndex]
-			match, err := evaluateCondition(value, condition.Operator, condition.Value)
+			match, err := evaluateCondition(row, db, condition)
 			if err != nil {
 				return nil, err
 			}
-			if !match {
-				continue
+			if match {
+				result = append(result, row)
 			}
+		} else {
+			result = append(result, row)
 		}
-		newRow := make([]interface{}, len(row))
-		copy(newRow, row)
-		result = append(result, newRow)
 	}
 	return result, nil
 }
@@ -175,8 +227,7 @@ func (db *Database) Update(tableName string, columnName string, newValue string,
 			if condColIndex == -1 {
 				return fmt.Errorf("столбец '%s' не найден в таблице '%s'", condition.Column, tableName)
 			}
-			condValue := row[condColIndex]
-			match, err := evaluateCondition(condValue, condition.Operator, condition.Value)
+			match, err := evaluateCondition(row, db, condition)
 			if err != nil {
 				return err
 			}
@@ -235,8 +286,7 @@ func (db *Database) Delete(tableName string, condition *Condition) error {
 			if colIndex == -1 {
 				return fmt.Errorf("столбец '%s' не найден в таблице '%s'", condition.Column, tableName)
 			}
-			value := row[colIndex]
-			match, err := evaluateCondition(value, condition.Operator, condition.Value)
+			match, err := evaluateCondition(row, db, condition)
 			if err != nil {
 				return err
 			}

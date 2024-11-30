@@ -7,11 +7,21 @@ import (
 	"strings"
 )
 
+type ConditionType int
+
+const (
+	Simple ConditionType = iota
+	Compound
+)
+
 type Condition struct {
+	Type      ConditionType
+	Left      *Condition
+	Right     *Condition
+	LogicalOp string
 	Column    string
 	Operator  string
 	Value     interface{}
-	LogicalOp string
 }
 
 func ParseAndExecute(db *Database, query string) ([][]interface{}, error) {
@@ -19,7 +29,8 @@ func ParseAndExecute(db *Database, query string) ([][]interface{}, error) {
 	if strings.HasSuffix(query, ";") {
 		query = query[:len(query)-1]
 	}
-	tokens := strings.Fields(query)
+
+	tokens := tokenize(query)
 	if len(tokens) == 0 {
 		return nil, errors.New("пустой запрос")
 	}
@@ -78,7 +89,7 @@ func handleCreate(db *Database, query string, tokens []string) ([][]interface{},
 	var columns []Column
 	for _, part := range columnsParts {
 		col := strings.Fields(strings.TrimSpace(part))
-		if len(col) != 2 {
+		if len(col) < 2 {
 			return nil, errors.New("неверный синтаксис определения столбца")
 		}
 		colName := col[0]
@@ -93,7 +104,16 @@ func handleCreate(db *Database, query string, tokens []string) ([][]interface{},
 		default:
 			return nil, fmt.Errorf("неизвестный тип данных '%s'", col[1])
 		}
-		columns = append(columns, Column{Name: colName, Type: colType})
+
+		autoIncrement := false
+		if len(col) > 2 && strings.ToUpper(col[2]) == "AUTO_INCREMENT" {
+			if colType != INTEGER {
+				return nil, errors.New("AUTO_INCREMENT поддерживается только для INTEGER типов")
+			}
+			autoIncrement = true
+		}
+
+		columns = append(columns, Column{Name: colName, Type: colType, AutoIncrement: autoIncrement})
 	}
 	err := db.CreateTable(tableName, columns)
 	if err != nil {
@@ -437,44 +457,129 @@ func parseJoin(tokens []string) (joinType string, joinTable string, joinConditio
 }
 
 func parseWhere(tokens []string, startIndex int) (*Condition, error) {
-	if startIndex >= len(tokens) {
-		return nil, errors.New("неверный синтаксис WHERE: отсутствует условие")
-	}
+	cond, _, err := parseCondition(tokens, startIndex, len(tokens))
+	return cond, err
+}
 
-	if startIndex+2 >= len(tokens) {
-		return nil, errors.New("неверный синтаксис WHERE: условие должно состоять из столбца, оператора и значения")
-	}
-
-	column := tokens[startIndex]
-	operator := tokens[startIndex+1]
-	valueToken := tokens[startIndex+2]
-
-	var value interface{}
-	if strings.HasPrefix(valueToken, "'") && strings.HasSuffix(valueToken, "'") {
-		value = strings.Trim(valueToken, "'")
-	} else {
-		if strings.Contains(valueToken, ".") {
-			floatVal, err := strconv.ParseFloat(valueToken, 64)
+func parseCondition(tokens []string, start, end int) (*Condition, int, error) {
+	var left *Condition
+	current := start
+	for current < end {
+		token := tokens[current]
+		if token == "(" {
+			subCond, nextIndex, err := parseCondition(tokens, current+1, end)
 			if err != nil {
-				return nil, fmt.Errorf("неизвестный тип значения '%s' в WHERE", valueToken)
+				return nil, current, err
 			}
-			value = floatVal
+			left = subCond
+			current = nextIndex
+		} else if token == ")" {
+			return left, current + 1, nil
 		} else {
-			intVal, err := strconv.Atoi(valueToken)
-			if err != nil {
-				return nil, fmt.Errorf("неизвестный тип значения '%s' в WHERE", valueToken)
+			if current+2 >= end {
+				return nil, current, errors.New("неверный синтаксис WHERE: недостаточно токенов для условия")
 			}
-			value = intVal
+			column := token
+			operator := tokens[current+1]
+			valueToken := tokens[current+2]
+			current += 3
+
+			var value interface{}
+			if strings.HasPrefix(valueToken, "'") && strings.HasSuffix(valueToken, "'") {
+				value = strings.Trim(valueToken, "'")
+			} else {
+				if strings.Contains(valueToken, ".") {
+					floatVal, err := strconv.ParseFloat(valueToken, 64)
+					if err != nil {
+						return nil, current, fmt.Errorf("неизвестный тип значения '%s' в WHERE", valueToken)
+					}
+					value = floatVal
+				} else {
+					intVal, err := strconv.Atoi(valueToken)
+					if err != nil {
+						return nil, current, fmt.Errorf("неизвестный тип значения '%s' в WHERE", valueToken)
+					}
+					value = intVal
+				}
+			}
+
+			cond := &Condition{
+				Type:     Simple,
+				Column:   column,
+				Operator: operator,
+				Value:    value,
+			}
+
+			left = cond
+		}
+
+		if current < end {
+			token = strings.ToUpper(tokens[current])
+			if token == "AND" || token == "OR" {
+				logicalOp := token
+				current++
+				rightCond, nextIndex, err := parseCondition(tokens, current, end)
+				if err != nil {
+					return nil, current, err
+				}
+				left = &Condition{
+					Type:      Compound,
+					Left:      left,
+					Right:     rightCond,
+					LogicalOp: logicalOp,
+				}
+				current = nextIndex
+			} else if token == ")" {
+				return left, current + 1, nil
+			} else {
+				break
+			}
 		}
 	}
 
-	condition := &Condition{
-		Column:   column,
-		Operator: operator,
-		Value:    value,
-	}
+	return left, current, nil
+}
 
-	return condition, nil
+func tokenize(query string) []string {
+	var tokens []string
+	var current strings.Builder
+	inQuotes := false
+	var quoteChar rune
+	for _, r := range query {
+		switch r {
+		case ' ', '\t', '\n', '\r':
+			if inQuotes {
+				current.WriteRune(r)
+			} else if current.Len() > 0 {
+				tokens = append(tokens, current.String())
+				current.Reset()
+			}
+		case '(', ')', ',', ';':
+			if inQuotes {
+				current.WriteRune(r)
+			} else {
+				if current.Len() > 0 {
+					tokens = append(tokens, current.String())
+					current.Reset()
+				}
+				tokens = append(tokens, string(r))
+			}
+		case '\'', '"':
+			current.WriteRune(r)
+			if inQuotes && r == quoteChar {
+				inQuotes = false
+			} else if !inQuotes {
+				inQuotes = true
+				quoteChar = r
+			}
+		default:
+			current.WriteRune(r)
+		}
+	}
+	if current.Len() > 0 {
+		tokens = append(tokens, current.String())
+	}
+	return tokens
 }
 
 func splitCSV(input string) []string {
@@ -500,40 +605,63 @@ func splitCSV(input string) []string {
 }
 
 func evaluateJoinedCondition(row []interface{}, db *Database, condition *Condition) (bool, error) {
-	var involvedTables []*Table
-	for _, table := range db.Tables {
-		involvedTables = append(involvedTables, table)
-	}
-
-	var allColumns []string
-	for _, table := range involvedTables {
-		for _, col := range table.Columns {
-			allColumns = append(allColumns, fmt.Sprintf("%s.%s", table.Name, col.Name))
-		}
-	}
-
-	var colIndex int = -1
-	for i, col := range allColumns {
-		if strings.ToLower(col) == strings.ToLower(condition.Column) || (strings.Contains(col, ".") && strings.ToLower(col[strings.Index(col, ".")+1:]) == strings.ToLower(condition.Column)) {
-			colIndex = i
-			break
-		}
-	}
-
-	if colIndex == -1 {
-		return false, fmt.Errorf("столбец '%s' не найден в результате", condition.Column)
-	}
-
-	value := row[colIndex]
-
-	match, err := evaluateCondition(value, condition.Operator, condition.Value)
-	if err != nil {
-		return false, err
-	}
-	return match, nil
+	return evaluateCondition(row, db, condition)
 }
 
-func evaluateCondition(value interface{}, operator string, target interface{}) (bool, error) {
+func evaluateCondition(row []interface{}, db *Database, condition *Condition) (bool, error) {
+	if condition.Type == Simple {
+		var involvedTables []*Table
+		for _, table := range db.Tables {
+			involvedTables = append(involvedTables, table)
+		}
+
+		var allColumns []string
+		for _, table := range involvedTables {
+			for _, col := range table.Columns {
+				allColumns = append(allColumns, fmt.Sprintf("%s.%s", table.Name, col.Name))
+			}
+		}
+
+		var colIndex int = -1
+		for i, col := range allColumns {
+			if strings.ToLower(col) == strings.ToLower(condition.Column) || (strings.Contains(col, ".") && strings.ToLower(col[strings.Index(col, ".")+1:]) == strings.ToLower(condition.Column)) {
+				colIndex = i
+				break
+			}
+		}
+
+		if colIndex == -1 {
+			return false, fmt.Errorf("столбец '%s' не найден в результате", condition.Column)
+		}
+
+		value := row[colIndex]
+
+		return evaluateSimpleCondition(value, condition.Operator, condition.Value)
+	} else if condition.Type == Compound {
+		leftResult, err := evaluateCondition(row, db, condition.Left)
+		if err != nil {
+			return false, err
+		}
+
+		rightResult, err := evaluateCondition(row, db, condition.Right)
+		if err != nil {
+			return false, err
+		}
+
+		switch condition.LogicalOp {
+		case "AND":
+			return leftResult && rightResult, nil
+		case "OR":
+			return leftResult || rightResult, nil
+		default:
+			return false, fmt.Errorf("неизвестный логический оператор '%s'", condition.LogicalOp)
+		}
+	}
+
+	return false, errors.New("неизвестный тип условия")
+}
+
+func evaluateSimpleCondition(value interface{}, operator string, target interface{}) (bool, error) {
 	switch v := value.(type) {
 	case int:
 		targetVal, ok := target.(int)
@@ -557,8 +685,13 @@ func evaluateCondition(value interface{}, operator string, target interface{}) (
 			return false, fmt.Errorf("неподдерживаемый оператор '%s'", operator)
 		}
 	case float64:
-		targetVal, ok := target.(float64)
-		if !ok {
+		var targetVal float64
+		switch tv := target.(type) {
+		case float64:
+			targetVal = tv
+		case int:
+			targetVal = float64(tv)
+		default:
 			return false, fmt.Errorf("несоответствие типов: сравнение FLOAT с %T", target)
 		}
 		switch operator {

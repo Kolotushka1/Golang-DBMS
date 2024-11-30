@@ -63,6 +63,15 @@ func (db *Database) Join(table1Name, table2Name, joinColumn1, joinColumn2 string
 			}
 		}
 	}
+
+	var columnNames []string
+	for _, col := range table1.Columns {
+		columnNames = append(columnNames, fmt.Sprintf("%s.%s", table1.Name, col.Name))
+	}
+	for _, col := range table2.Columns {
+		columnNames = append(columnNames, fmt.Sprintf("%s.%s", table2.Name, col.Name))
+	}
+
 	return result, nil
 }
 

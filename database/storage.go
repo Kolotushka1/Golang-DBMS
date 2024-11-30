@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -40,8 +41,59 @@ func (db *Database) LoadFromDisk() error {
 			if err != nil {
 				return fmt.Errorf("ошибка маршалинга файла '%s': %v", file.Name(), err)
 			}
+
+			for i, row := range table.Rows {
+				for j, col := range table.Columns {
+					value := row[j]
+					correctedValue, err := correctType(value, col.Type)
+					if err != nil {
+						return fmt.Errorf("Ошибка преобразования значения '%v' в столбце '%s' в строке %d: %v", value, col.Name, i, err)
+					}
+					table.Rows[i][j] = correctedValue
+				}
+			}
+
 			db.Tables[strings.ToLower(table.Name)] = &table
 		}
 	}
 	return nil
+}
+
+func correctType(value interface{}, dataType DataType) (interface{}, error) {
+	switch dataType {
+	case INTEGER:
+		switch v := value.(type) {
+		case float64:
+			return int(v), nil
+		case int:
+			return v, nil
+		case string:
+			intVal, err := strconv.Atoi(v)
+			if err != nil {
+				return nil, fmt.Errorf("не удалось преобразовать '%v' в INTEGER", v)
+			}
+			return intVal, nil
+		default:
+			return nil, fmt.Errorf("неподдерживаемый тип '%T' для INTEGER", v)
+		}
+	case FLOAT:
+		switch v := value.(type) {
+		case float64:
+			return v, nil
+		case int:
+			return float64(v), nil
+		case string:
+			floatVal, err := strconv.ParseFloat(v, 64)
+			if err != nil {
+				return nil, fmt.Errorf("не удалось преобразовать '%v' в FLOAT", v)
+			}
+			return floatVal, nil
+		default:
+			return nil, fmt.Errorf("неподдерживаемый тип '%T' для FLOAT", v)
+		}
+	case STRING:
+		return fmt.Sprintf("%v", value), nil
+	default:
+		return nil, fmt.Errorf("неизвестный тип данных '%v'", dataType)
+	}
 }
