@@ -206,6 +206,8 @@ func handleSelect(db *Database, query string, tokens []string) ([][]interface{},
 	}
 
 	var joinedData [][]interface{}
+	var columnNames []string
+
 	if joinType != "" {
 		onParts := strings.Split(joinCondition, "=")
 		if len(onParts) != 2 {
@@ -243,10 +245,22 @@ func handleSelect(db *Database, query string, tokens []string) ([][]interface{},
 			return nil, err
 		}
 
+		table1, exists1 := db.Tables[strings.ToLower(tableName)]
+		table2, exists2 := db.Tables[strings.ToLower(joinTable)]
+		if !exists1 || !exists2 {
+			return nil, errors.New("одна или обе таблицы не существуют")
+		}
+		for _, col := range table1.Columns {
+			columnNames = append(columnNames, fmt.Sprintf("%s.%s", table1.Name, col.Name))
+		}
+		for _, col := range table2.Columns {
+			columnNames = append(columnNames, fmt.Sprintf("%s.%s", table2.Name, col.Name))
+		}
+
 		if condition != nil {
 			filteredData := [][]interface{}{}
 			for _, row := range joinedData {
-				match, err := evaluateJoinedCondition(row, db, condition)
+				match, err := evaluateJoinedCondition(row, columnNames, condition)
 				if err != nil {
 					return nil, err
 				}
@@ -258,42 +272,43 @@ func handleSelect(db *Database, query string, tokens []string) ([][]interface{},
 		}
 
 	} else {
-		rows, err := db.Select(tableName, condition)
+		rows, err := db.Select(tableName, nil)
 		if err != nil {
 			return nil, err
 		}
 		joinedData = rows
+
+		table, exists := db.Tables[strings.ToLower(tableName)]
+		if !exists {
+			return nil, fmt.Errorf("таблица '%s' не существует", tableName)
+		}
+		for _, col := range table.Columns {
+			columnNames = append(columnNames, col.Name)
+		}
+
+		if condition != nil {
+			filteredData := [][]interface{}{}
+			for _, row := range joinedData {
+				match, err := evaluateCondition(row, columnNames, condition)
+				if err != nil {
+					return nil, err
+				}
+				if match {
+					filteredData = append(filteredData, row)
+				}
+			}
+			joinedData = filteredData
+		}
 	}
 
 	if len(selectColumns) > 0 && selectColumns[0] != "*" {
 		var selectedIndexes []int
-		var allColumns []string
-		if joinType != "" {
-			table1, exists1 := db.Tables[strings.ToLower(tableName)]
-			table2, exists2 := db.Tables[strings.ToLower(joinTable)]
-			if !exists1 || !exists2 {
-				return nil, errors.New("одна или обе таблицы не существуют")
-			}
-			for _, col := range table1.Columns {
-				allColumns = append(allColumns, fmt.Sprintf("%s.%s", table1.Name, col.Name))
-			}
-			for _, col := range table2.Columns {
-				allColumns = append(allColumns, fmt.Sprintf("%s.%s", table2.Name, col.Name))
-			}
-		} else {
-			table, exists := db.Tables[strings.ToLower(tableName)]
-			if !exists {
-				return nil, fmt.Errorf("таблица '%s' не существует", tableName)
-			}
-			for _, col := range table.Columns {
-				allColumns = append(allColumns, col.Name)
-			}
-		}
+		allColumns := columnNames
 
 		for _, col := range selectColumns {
 			index := -1
 			for i, ac := range allColumns {
-				if strings.ToLower(ac) == strings.ToLower(col) || (strings.Contains(ac, ".") && strings.ToLower(ac[strings.Index(ac, ".")+1:]) == strings.ToLower(col)) {
+				if strings.ToLower(ac) == strings.ToLower(col) || (strings.Contains(ac, ".") && strings.ToLower(ac[strings.LastIndex(ac, ".")+1:]) == strings.ToLower(col)) {
 					index = i
 					break
 				}
@@ -457,15 +472,23 @@ func parseJoin(tokens []string) (joinType string, joinTable string, joinConditio
 }
 
 func parseWhere(tokens []string, startIndex int) (*Condition, error) {
-	cond, _, err := parseCondition(tokens, startIndex, len(tokens))
-	return cond, err
+	cond, nextIndex, err := parseCondition(tokens, startIndex, len(tokens))
+	if err != nil {
+		return nil, err
+	}
+	if nextIndex != len(tokens) && tokens[nextIndex] != ";" {
+		return nil, fmt.Errorf("неверный синтаксис WHERE: неожиданный токен '%s'", tokens[nextIndex])
+	}
+	return cond, nil
 }
 
 func parseCondition(tokens []string, start, end int) (*Condition, int, error) {
 	var left *Condition
 	current := start
+
 	for current < end {
 		token := tokens[current]
+
 		if token == "(" {
 			subCond, nextIndex, err := parseCondition(tokens, current+1, end)
 			if err != nil {
@@ -474,7 +497,25 @@ func parseCondition(tokens []string, start, end int) (*Condition, int, error) {
 			left = subCond
 			current = nextIndex
 		} else if token == ")" {
-			return left, current + 1, nil
+			current++
+			return left, current, nil
+		} else if strings.ToUpper(token) == "AND" || strings.ToUpper(token) == "OR" {
+			if left == nil {
+				return nil, current, fmt.Errorf("неверный синтаксис WHERE: логический оператор '%s' без левого условия", token)
+			}
+			logicalOp := strings.ToUpper(token)
+			current++
+			rightCond, nextIndex, err := parseCondition(tokens, current, end)
+			if err != nil {
+				return nil, current, err
+			}
+			left = &Condition{
+				Type:      Compound,
+				Left:      left,
+				Right:     rightCond,
+				LogicalOp: logicalOp,
+			}
+			current = nextIndex
 		} else {
 			if current+2 >= end {
 				return nil, current, errors.New("неверный синтаксис WHERE: недостаточно токенов для условия")
@@ -488,18 +529,12 @@ func parseCondition(tokens []string, start, end int) (*Condition, int, error) {
 			if strings.HasPrefix(valueToken, "'") && strings.HasSuffix(valueToken, "'") {
 				value = strings.Trim(valueToken, "'")
 			} else {
-				if strings.Contains(valueToken, ".") {
-					floatVal, err := strconv.ParseFloat(valueToken, 64)
-					if err != nil {
-						return nil, current, fmt.Errorf("неизвестный тип значения '%s' в WHERE", valueToken)
-					}
+				if intVal, err := strconv.Atoi(valueToken); err == nil {
+					value = intVal
+				} else if floatVal, err := strconv.ParseFloat(valueToken, 64); err == nil {
 					value = floatVal
 				} else {
-					intVal, err := strconv.Atoi(valueToken)
-					if err != nil {
-						return nil, current, fmt.Errorf("неизвестный тип значения '%s' в WHERE", valueToken)
-					}
-					value = intVal
+					return nil, current, fmt.Errorf("неизвестный тип значения '%s' в WHERE", valueToken)
 				}
 			}
 
@@ -510,30 +545,26 @@ func parseCondition(tokens []string, start, end int) (*Condition, int, error) {
 				Value:    value,
 			}
 
-			left = cond
+			if left == nil {
+				left = cond
+			} else {
+				return nil, current, errors.New("неверный синтаксис WHERE: отсутствует логический оператор между условиями")
+			}
 		}
 
-		if current < end {
-			token = strings.ToUpper(tokens[current])
-			if token == "AND" || token == "OR" {
-				logicalOp := token
-				current++
-				rightCond, nextIndex, err := parseCondition(tokens, current, end)
-				if err != nil {
-					return nil, current, err
-				}
-				left = &Condition{
-					Type:      Compound,
-					Left:      left,
-					Right:     rightCond,
-					LogicalOp: logicalOp,
-				}
-				current = nextIndex
-			} else if token == ")" {
-				return left, current + 1, nil
-			} else {
-				break
-			}
+		if current >= end {
+			break
+		}
+
+		token = tokens[current]
+		upperToken := strings.ToUpper(token)
+		if upperToken == "AND" || upperToken == "OR" {
+			continue
+		} else if token == ")" {
+			current++
+			return left, current, nil
+		} else {
+			break
 		}
 	}
 
@@ -545,16 +576,47 @@ func tokenize(query string) []string {
 	var current strings.Builder
 	inQuotes := false
 	var quoteChar rune
-	for _, r := range query {
-		switch r {
-		case ' ', '\t', '\n', '\r':
+
+	operatorChars := "=!<>"
+
+	for i := 0; i < len(query); i++ {
+		r := rune(query[i])
+		switch {
+		case r == ' ' || r == '\t' || r == '\n' || r == '\r':
 			if inQuotes {
 				current.WriteRune(r)
 			} else if current.Len() > 0 {
 				tokens = append(tokens, current.String())
 				current.Reset()
 			}
-		case '(', ')', ',', ';':
+		case r == '\'' || r == '"':
+			current.WriteRune(r)
+			if inQuotes && r == quoteChar {
+				inQuotes = false
+			} else if !inQuotes {
+				inQuotes = true
+				quoteChar = r
+			}
+		case strings.ContainsRune(operatorChars, r):
+			if inQuotes {
+				current.WriteRune(r)
+			} else {
+				if current.Len() > 0 {
+					tokens = append(tokens, current.String())
+					current.Reset()
+				}
+				if i+1 < len(query) {
+					nextR := rune(query[i+1])
+					op := string(r) + string(nextR)
+					if op == "<=" || op == ">=" || op == "!=" || op == "<>" {
+						tokens = append(tokens, op)
+						i++
+						continue
+					}
+				}
+				tokens = append(tokens, string(r))
+			}
+		case r == '(', r == ')', r == ',', r == ';':
 			if inQuotes {
 				current.WriteRune(r)
 			} else {
@@ -563,14 +625,6 @@ func tokenize(query string) []string {
 					current.Reset()
 				}
 				tokens = append(tokens, string(r))
-			}
-		case '\'', '"':
-			current.WriteRune(r)
-			if inQuotes && r == quoteChar {
-				inQuotes = false
-			} else if !inQuotes {
-				inQuotes = true
-				quoteChar = r
 			}
 		default:
 			current.WriteRune(r)
@@ -604,27 +658,15 @@ func splitCSV(input string) []string {
 	return result
 }
 
-func evaluateJoinedCondition(row []interface{}, db *Database, condition *Condition) (bool, error) {
-	return evaluateCondition(row, db, condition)
+func evaluateJoinedCondition(row []interface{}, columnNames []string, condition *Condition) (bool, error) {
+	return evaluateCondition(row, columnNames, condition)
 }
 
-func evaluateCondition(row []interface{}, db *Database, condition *Condition) (bool, error) {
+func evaluateCondition(row []interface{}, columnNames []string, condition *Condition) (bool, error) {
 	if condition.Type == Simple {
-		var involvedTables []*Table
-		for _, table := range db.Tables {
-			involvedTables = append(involvedTables, table)
-		}
-
-		var allColumns []string
-		for _, table := range involvedTables {
-			for _, col := range table.Columns {
-				allColumns = append(allColumns, fmt.Sprintf("%s.%s", table.Name, col.Name))
-			}
-		}
-
 		var colIndex int = -1
-		for i, col := range allColumns {
-			if strings.ToLower(col) == strings.ToLower(condition.Column) || (strings.Contains(col, ".") && strings.ToLower(col[strings.Index(col, ".")+1:]) == strings.ToLower(condition.Column)) {
+		for i, col := range columnNames {
+			if strings.ToLower(col) == strings.ToLower(condition.Column) || (strings.Contains(col, ".") && strings.ToLower(col[strings.LastIndex(col, ".")+1:]) == strings.ToLower(condition.Column)) {
 				colIndex = i
 				break
 			}
@@ -638,12 +680,12 @@ func evaluateCondition(row []interface{}, db *Database, condition *Condition) (b
 
 		return evaluateSimpleCondition(value, condition.Operator, condition.Value)
 	} else if condition.Type == Compound {
-		leftResult, err := evaluateCondition(row, db, condition.Left)
+		leftResult, err := evaluateCondition(row, columnNames, condition.Left)
 		if err != nil {
 			return false, err
 		}
 
-		rightResult, err := evaluateCondition(row, db, condition.Right)
+		rightResult, err := evaluateCondition(row, columnNames, condition.Right)
 		if err != nil {
 			return false, err
 		}

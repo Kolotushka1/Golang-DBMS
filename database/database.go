@@ -186,7 +186,7 @@ func (db *Database) Select(tableName string, condition *Condition) ([][]interfac
 	var result [][]interface{}
 	for _, row := range table.Rows {
 		if condition != nil {
-			match, err := evaluateCondition(row, db, condition)
+			match, err := evaluateCondition(row, columnNames, condition)
 			if err != nil {
 				return nil, err
 			}
@@ -221,13 +221,14 @@ func (db *Database) Update(tableName string, columnName string, newValue string,
 		return fmt.Errorf("столбец '%s' не найден в таблице '%s'", columnName, tableName)
 	}
 
+	var columnNames []string
+	for _, col := range table.Columns {
+		columnNames = append(columnNames, col.Name)
+	}
+
 	for rowIdx, row := range table.Rows {
 		if condition != nil {
-			condColIndex := getColumnIndex(table, condition.Column)
-			if condColIndex == -1 {
-				return fmt.Errorf("столбец '%s' не найден в таблице '%s'", condition.Column, tableName)
-			}
-			match, err := evaluateCondition(row, db, condition)
+			match, err := evaluateCondition(row, columnNames, condition)
 			if err != nil {
 				return err
 			}
@@ -278,15 +279,18 @@ func (db *Database) Delete(tableName string, condition *Condition) error {
 	if !exists {
 		return fmt.Errorf("таблица '%s' не существует", tableName)
 	}
+
+	// Создаем список имен столбцов
+	var columnNames []string
+	for _, col := range table.Columns {
+		columnNames = append(columnNames, col.Name)
+	}
+
 	var newRows [][]interface{}
 	for _, row := range table.Rows {
 		deleteRow := false
 		if condition != nil {
-			colIndex := getColumnIndex(table, condition.Column)
-			if colIndex == -1 {
-				return fmt.Errorf("столбец '%s' не найден в таблице '%s'", condition.Column, tableName)
-			}
-			match, err := evaluateCondition(row, db, condition)
+			match, err := evaluateCondition(row, columnNames, condition)
 			if err != nil {
 				return err
 			}
